@@ -130,8 +130,9 @@ COUNTRY_INFO.update({
 # عداد مؤقت لتكرار نزول الرقم (بحد أقصى لكل مستخدم لمنع تسرب الذاكرة على المدى الطويل - 24/7)
 repeat_tracker = {}
 REPEAT_TRACKER_MAX_PER_USER = 2000  # أقصى عدد أرقام يُحتفظ بها لكل مستخدم قبل تنظيف الأقدم
+bot_owner_id = None  # مُعرَّف على مستوى الوحدة لتجنب خطأ global قبل التعريف
 
-MAX_CONCURRENT_REQUESTS = 3
+MAX_CONCURRENT_REQUESTS = 1  # طلب واحد فقط في نفس الوقت لكل مستخدم لتجنب 409 من Durian
 # Semaphore لكل مستخدم بدل Semaphore عالمي واحد يتشاركه كل المستخدمين،
 # حتى لا يُصبح مستخدم واحد كثيف الطلبات عنق زجاجة لبقية المستخدمين على نفس السيرفر.
 _user_semaphores = {}
@@ -395,8 +396,11 @@ async def user_bot_callback_handler(update: Update, context: ContextTypes.DEFAUL
 
         bot_owner_id = user_id
 
+        # حساب وقت تأخير آمن بناءً على عدد الحسابات والدول لتجنب Rate Limit
+        safe_interval = max(3, int(len(active_accounts) * len(countries) * 1.5))
+
         context.job_queue.run_repeating(
-            check_and_hunt_numbers, interval=1, first=1, user_id=user_id,
+            check_and_hunt_numbers, interval=safe_interval, first=1, user_id=user_id,
             name=f"hunt_{user_id}"
         )
         await asyncio.to_thread(db.set_hunting_status, user_id, 1)
@@ -816,6 +820,8 @@ async def check_and_hunt_numbers(context: ContextTypes.DEFAULT_TYPE):
         try:
             t_sem_start = time.perf_counter()
             async with user_semaphore:
+                # تأخير آمن داخل الطابور لتجنب 409 من واجهة Durian
+                await asyncio.sleep(1.0)
                 t_sem_end = time.perf_counter()
                 t_api_start = time.perf_counter()
                 result = await DurianAPI.order_number_by_name(username, api_key, clean_country, project_id="0257")
