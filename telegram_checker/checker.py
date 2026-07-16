@@ -34,22 +34,13 @@ class SmartCheckStrategy:
     async def _check_via_external_bot(self, client, phone, bot_username):
         """فحص الرقم عبر بوت فحص خارجي عبر رسائل تيليجرام المباشرة"""
         try:
-            bot_username_clean = bot_username.replace('@', '')
-            from telethon import functions
-            try:
-                bot_entity = await client.get_input_entity(bot_username_clean)
-            except ValueError:
-                logger.info(f"[ExternalBot] Resolving username {bot_username_clean} from server...")
-                result = await client(functions.contacts.ResolveUsernameRequest(bot_username_clean))
-                bot_entity = result.users[0]
-
             before_send = datetime.datetime.now(datetime.timezone.utc)
-            await client.send_message(bot_entity, phone)
+            await client.send_message(bot_username, phone)
             logger.info(f"[ExternalBot] Sent {phone} to {bot_username}, waiting for response...")
 
             for _ in range(45):  # انتظار حتى 45 ثانية
                 await asyncio.sleep(1)
-                messages = await client.get_messages(bot_entity, limit=3)
+                messages = await client.get_messages(bot_username, limit=3)
                 for msg in messages:
                     if msg.out:
                         continue
@@ -65,13 +56,13 @@ class SmartCheckStrategy:
                             logger.info(f"[ExternalBot] ✅ Result: BANNED (Phone: {phone})")
                             return {"status": "BANNED", "phone": phone, "status_text": "📵 مـحـظـور"}
                         elif '🔴' in reply:
-                            logger.info(f"[ExternalBot] Bot returned ERROR for {phone}")
+                            logger.warning(f"[ExternalBot] Bot returned ERROR for {phone}")
                             return None
 
-            logger.info(f"[ExternalBot] Timeout waiting for response (Phone: {phone})")
+            logger.warning(f"[ExternalBot] Timeout waiting for response (Phone: {phone})")
             return None
         except Exception as e:
-            logger.info(f"[ExternalBot] Failed to communicate with bot {bot_username}: {type(e).__name__} - {e}")
+            logger.error(f"[ExternalBot] Failed to communicate with bot {bot_username}: {type(e).__name__} - {e}")
             return None
 
     async def check(self, client, phone, account):
@@ -127,7 +118,7 @@ class SmartCheckStrategy:
         except Exception as e:
             error_message = str(e).upper()
             logger.warning(f"[Layer 1] Silent Phase error: {e}")
-            if "BANNED" in error_message or "AUTHKEY" in type(e).__name__.upper() or "NOT REGISTERED" in error_message or "DEACTIVATED" in type(e).__name__.upper():
+            if "BANNED" in error_message or "AUTH_KEY_UNREGISTERED" in error_message:
                 await account_manager.disable_account(account["id"])
                 return {"status": "ACCOUNT_DISABLED", "phone": phone, "status_text": "❌ حساب الفاحص تالف وتم تعطيله"}
 
@@ -203,7 +194,7 @@ class SmartCheckStrategy:
                     "status_text": "📵 مـحـظـور"
                 }
 
-            elif "AUTHKEY" in error_type or "NOT REGISTERED" in error_str or "DEACTIVATED" in error_type:
+            elif "AUTH_KEY" in error_str:
                 await account_manager.disable_account(account["id"])
                 return {"status": "ACCOUNT_DISABLED", "phone": phone, "status_text": "❌ حساب الفاحص تالف وتم تعطيله"}
 
@@ -365,7 +356,7 @@ class SmartCheckStrategy:
                 return {"status": "NO_SESSION", "phone": phone, "status_text": "🆕 غير مسجل"}
             if "BANNED" in error_str:
                 return {"status": "BANNED", "phone": phone, "status_text": "📵 مـحـظـور"}
-            if "AUTHKEY" in type(e).__name__.upper() or "NOT REGISTERED" in error_str or "DEACTIVATED" in type(e).__name__.upper():
+            if "AUTH_KEY" in error_str:
                 await account_manager.disable_account(account["id"])
                 return {"status": "ACCOUNT_DISABLED", "phone": phone, "status_text": "❌ حساب الفاحص تالف"}
             return {"status": "ERROR", "phone": phone, "status_text": f"⚙️ خطأ نظام: {e}"}
@@ -448,10 +439,7 @@ class TelegramChecker:
                         try:
                             # محاولة تهيئة الاتصال بدون إثارة أخطاء
                             client = await telegram_client_manager.get_client(acc)
-                            if not client.is_connected():
-                                await client.connect()
-                            me = await client.get_me()
-                            if me:
+                            if await client.is_user_authorized():
                                 logger.info(f"[Auto-Recovery] Account {acc['phone']} is authorized! Recovering...")
                                 await account_manager.enable_account(acc["id"])
                         except SessionUnauthorizedError:
