@@ -149,6 +149,20 @@ _db_cache = {}          # {user_id: {"accounts": [...], "channel": ..., "countri
 _db_cache_ts = {}       # {user_id: timestamp آخر تحديث}
 _db_cache_locks = {}    # {user_id: asyncio.Lock} يمنع Cache Stampede عند تزامن أول قراءة بعد انتهاء الكاش
 DB_CACHE_TTL = 60       # ثانية (مُحسَّن من 30 → 60 لتخفيف ضغط استعلامات DB)
+# The hunt job can run as often as once per second.  When all checker accounts
+# are unavailable this keeps the operational warning useful without flooding
+# the logs on every scheduled run.
+_checker_unavailable_log_ts = {}
+CHECKER_UNAVAILABLE_LOG_INTERVAL = 60
+
+def _should_log_checker_unavailable(user_id, now=None):
+    """Return whether the unavailable-checker warning may be emitted now."""
+    now = time.monotonic() if now is None else now
+    last_log = _checker_unavailable_log_ts.get(user_id)
+    if last_log is None or now - last_log >= CHECKER_UNAVAILABLE_LOG_INTERVAL:
+        _checker_unavailable_log_ts[user_id] = now
+        return True
+    return False
 
 def _get_cache_lock(user_id):
     lock = _db_cache_locks.get(user_id)
@@ -783,7 +797,7 @@ async def check_and_hunt_numbers(context: ContextTypes.DEFAULT_TYPE):
         channel               = _db_cache[user_id]["channel"]
         countries             = _db_cache[user_id]["countries"]
         country_settings_map  = _db_cache[user_id].get("country_settings", {})
-        logger.info(
+        logger.debug(
             f"[PERF_TRACE] [User: {user_id}] DB served from cache (age={cache_age:.1f}s)"
         )
 
@@ -801,10 +815,15 @@ async def check_and_hunt_numbers(context: ContextTypes.DEFAULT_TYPE):
     # وتجنب تراكم أرقام بحالة "غير معروفة"
     checker_probe = await telegram_checker.get_available_account()
     if not checker_probe:
-        logger.warning(
-            f"[User: {user_id}] تم تخطي دورة الصيد هذه لأنه لا يوجد أي حساب فاحص نشط أو متاح حالياً (جميع الحسابات في FloodWait أو معطلة)."
-        )
+        if _should_log_checker_unavailable(user_id):
+            logger.warning(
+                f"[User: {user_id}] تم إيقاف سحب الأرقام مؤقتاً لأنه لا يوجد أي حساب فاحص نشط أو متاح حالياً "
+                "(جميع الحسابات في FloodWait أو معطلة). سيُعاد التحقق تلقائياً."
+            )
         return
+
+    # A checker recovered: permit a future outage to be logged immediately.
+    _checker_unavailable_log_ts.pop(user_id, None)
 
     if user_id not in repeat_tracker:
         repeat_tracker[user_id] = {}

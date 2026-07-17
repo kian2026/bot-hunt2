@@ -31,6 +31,7 @@ class BotManager:
             if user_id in self.running_tasks:
                 return False # البوت يعمل بالفعل
 
+            app = None
             try:
                 # إنشاء التطبيق الخاص بالبوت الفرعي وتفعيل الـ Job Queue الخاص به
                 app = create_user_app(token)
@@ -51,6 +52,22 @@ class BotManager:
                 return True
             except Exception as e:
                 logger.error(f"❌ خطأ أثناء تشغيل بوت المستخدم {user_id}: {e}")
+                # A failed initialization can leave polling sockets and HTTP
+                # sessions open.  Tear down the partially started app before
+                # allowing a retry for this user.
+                if app:
+                    try:
+                        if app.updater and app.updater.running:
+                            await app.updater.stop()
+                        if app.running:
+                            await app.stop()
+                        await app.shutdown()
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            "Could not clean up failed bot startup for %s: %s",
+                            user_id,
+                            cleanup_error,
+                        )
                 return False
 
     async def _run_app_loop(self, user_id: int):
@@ -63,29 +80,34 @@ class BotManager:
 
     async def stop_bot(self, user_id: int) -> bool:
         """إيقاف البوت بشكل آمن وتحرير الموارد"""
-        if user_id not in self.running_tasks:
-            return False
+        async with self._start_locks[user_id]:
+            if user_id not in self.running_tasks:
+                return False
 
-        app = self.running_apps.get(user_id)
-        task = self.running_tasks.get(user_id)
+            app = self.running_apps.get(user_id)
+            task = self.running_tasks.get(user_id)
 
-        try:
-            if app:
-                # إيقاف التحديثات أولاً ثم قفل التطبيق بالترتيب الصحيح
-                if app.updater and app.updater.running:
-                    await app.updater.stop()
-                await app.stop()
-                await app.shutdown()
-            
-            if task:
-                task.cancel()
-        except Exception as e:
-            logger.error(f"⚠️ خطأ أثناء إيقاف الموارد للبوت {user_id}: {e}")
-        finally:
-            # تنظيف الذاكرة في كل الأحوال
-            self.running_tasks.pop(user_id, None)
-            self.running_apps.pop(user_id, None)
-            await asyncio.to_thread(db.set_status, user_id, 0)
+            try:
+                if app:
+                    # إيقاف التحديثات أولاً ثم قفل التطبيق بالترتيب الصحيح
+                    if app.updater and app.updater.running:
+                        await app.updater.stop()
+                    await app.stop()
+                    await app.shutdown()
+
+                if task:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+            except Exception as e:
+                logger.error(f"⚠️ خطأ أثناء إيقاف الموارد للبوت {user_id}: {e}")
+            finally:
+                # تنظيف الذاكرة في كل الأحوال
+                self.running_tasks.pop(user_id, None)
+                self.running_apps.pop(user_id, None)
+                await asyncio.to_thread(db.set_status, user_id, 0)
             
         logger.info(f"🛑 تم إيقاف البوت وتحرير مساحته للمرسل: {user_id}")
         return True

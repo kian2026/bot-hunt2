@@ -1,22 +1,19 @@
 import asyncio
-import os
 import logging
 import time
-import traceback
 import datetime
 from telethon import functions, types
 from telethon.errors import (
     FloodWaitError, UserPrivacyRestrictedError, PhoneNumberBannedError,
     SessionPasswordNeededError, PhoneNumberInvalidError,
-    PhoneNumberUnoccupiedError, PhoneMigrateError, PhoneCodeInvalidError
+    PhoneNumberUnoccupiedError, PhoneMigrateError
 )
 from telethon.tl.types.auth import (
-    SentCodeTypeApp, SentCodeTypeSms, SentCodeTypeFlashCall, SentCodeTypeMissedCall, SentCodeTypeEmailCode
+    SentCodeTypeApp, SentCodeTypeSms
 )
 from .telegram_client import telegram_client_manager, SessionUnauthorizedError
 from .account_manager import account_manager
 from .flood_manager import flood_manager
-from proxy_infrastructure import proxy_manager
 
 logger = logging.getLogger(__name__)
 
@@ -31,39 +28,57 @@ class SmartCheckStrategy:
     2. الطبقة الثانية: فحص الخادم المباشر وتحديد الخصوصية (ResolvePhoneRequest) - لمعالجة قيود الخصوصية والتفريق الدقيق.
     3. الطبقة الثالثة: فحص التدفق بالكود التجريبي (send_code_request) - الملاذ الأخير الحاسم لتحديد وجود التطبيق (App vs SMS) مع إلغاء الكود فوراً وبشكل حاسم لتجنب إرسال أي رسالة للمستهدف.
     """
+    def __init__(self):
+        # Several worker accounts can delegate to the same external-checker
+        # account.  That bot has a single chat history, so concurrent requests
+        # could read one another's replies and return the wrong phone result.
+        self._external_bot_locks = {}
+
+    def _external_bot_lock(self, client):
+        client_id = id(client)
+        lock = self._external_bot_locks.get(client_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._external_bot_locks[client_id] = lock
+        return lock
+
     async def _check_via_external_bot(self, client, phone, bot_username):
         """فحص الرقم عبر بوت فحص خارجي عبر رسائل تيليجرام المباشرة"""
-        try:
-            before_send = datetime.datetime.now(datetime.timezone.utc)
-            await client.send_message(bot_username, phone)
-            logger.info(f"[ExternalBot] Sent {phone} to {bot_username}, waiting for response...")
+        # Hold the lock for the full request/response cycle, not just sending.
+        # Otherwise another task can send its number before this task reads the
+        # response and the two results become indistinguishable.
+        async with self._external_bot_lock(client):
+            try:
+                before_send = datetime.datetime.now(datetime.timezone.utc)
+                await client.send_message(bot_username, phone)
+                logger.info(f"[ExternalBot] Sent {phone} to {bot_username}, waiting for response...")
 
-            for _ in range(45):  # انتظار حتى 45 ثانية
-                await asyncio.sleep(1)
-                messages = await client.get_messages(bot_username, limit=3)
-                for msg in messages:
-                    if msg.out:
-                        continue
-                    if msg.date >= before_send and '📊' in (msg.text or ''):
-                        reply = msg.text
-                        if '🔐' in reply:
-                            logger.info(f"[ExternalBot] ✅ Result: REGISTERED (Phone: {phone})")
-                            return {"status": "HAS_SESSION", "phone": phone, "status_text": "⚠️ الرقم لديه جلسة"}
-                        elif '✅' in reply:
-                            logger.info(f"[ExternalBot] ✅ Result: NOT REGISTERED (Phone: {phone})")
-                            return {"status": "NO_SESSION", "phone": phone, "status_text": "🆕 غير مسجل"}
-                        elif '❌' in reply:
-                            logger.info(f"[ExternalBot] ✅ Result: BANNED (Phone: {phone})")
-                            return {"status": "BANNED", "phone": phone, "status_text": "📵 مـحـظـور"}
-                        elif '🔴' in reply:
-                            logger.warning(f"[ExternalBot] Bot returned ERROR for {phone}")
-                            return None
+                for _ in range(45):  # انتظار حتى 45 ثانية
+                    await asyncio.sleep(1)
+                    messages = await client.get_messages(bot_username, limit=3)
+                    for msg in messages:
+                        if msg.out:
+                            continue
+                        if msg.date >= before_send and '📊' in (msg.text or ''):
+                            reply = msg.text
+                            if '🔐' in reply:
+                                logger.info(f"[ExternalBot] ✅ Result: REGISTERED (Phone: {phone})")
+                                return {"status": "HAS_SESSION", "phone": phone, "status_text": "⚠️ الرقم لديه جلسة"}
+                            elif '✅' in reply:
+                                logger.info(f"[ExternalBot] ✅ Result: NOT REGISTERED (Phone: {phone})")
+                                return {"status": "NO_SESSION", "phone": phone, "status_text": "🆕 غير مسجل"}
+                            elif '❌' in reply:
+                                logger.info(f"[ExternalBot] ✅ Result: BANNED (Phone: {phone})")
+                                return {"status": "BANNED", "phone": phone, "status_text": "📵 مـحـظـور"}
+                            elif '🔴' in reply:
+                                logger.warning(f"[ExternalBot] Bot returned ERROR for {phone}")
+                                return None
 
-            logger.warning(f"[ExternalBot] Timeout waiting for response (Phone: {phone})")
-            return None
-        except Exception as e:
-            logger.error(f"[ExternalBot] Failed to communicate with bot {bot_username}: {type(e).__name__} - {e}")
-            return None
+                logger.warning(f"[ExternalBot] Timeout waiting for response (Phone: {phone})")
+                return None
+            except Exception as e:
+                logger.error(f"[ExternalBot] Failed to communicate with bot {bot_username}: {type(e).__name__} - {e}")
+                return None
 
     async def check(self, client, phone, account):
         import database as db
@@ -93,6 +108,12 @@ class SmartCheckStrategy:
                 logger.info(f"[Layer 1] Contact imported! Registered. (Phone: {phone})")
                 layer_results["layer1"] = "HAS_SESSION"
                 return {"status": "HAS_SESSION", "phone": phone, "status_text": "⚠️ الرقم لديه جلسة"}
+            else:
+                # An empty import result is useful evidence for the honeypot
+                # verification below.  Previously this value was never set,
+                # making the `layer1 == NO_SESSION` honeypot condition
+                # impossible to reach.
+                layer_results["layer1"] = "NO_SESSION"
 
         except PhoneMigrateError as e:
             # معالجة فورية لانتقال مركز البيانات
@@ -115,10 +136,21 @@ class SmartCheckStrategy:
                 "phone": phone,
                 "status_text": f"🚫 حظر مؤقت {e.seconds} ثانية"
             }
+        except PhoneNumberBannedError:
+            # This error describes the *phone being checked*, not the checker
+            # account.  Treating every error containing "BANNED" as an account
+            # failure disabled healthy new checker accounts after their first
+            # banned-number lookup.
+            logger.info(f"[Layer 1] Phone is banned. (Phone: {phone})")
+            return {
+                "status": "BANNED",
+                "phone": phone,
+                "status_text": "📵 مـحـظـور"
+            }
         except Exception as e:
             error_message = str(e).upper()
             logger.warning(f"[Layer 1] Silent Phase error: {e}")
-            if "BANNED" in error_message or "AUTH_KEY_UNREGISTERED" in error_message:
+            if "AUTH_KEY_UNREGISTERED" in error_message:
                 await account_manager.disable_account(account["id"])
                 return {"status": "ACCOUNT_DISABLED", "phone": phone, "status_text": "❌ حساب الفاحص تالف وتم تعطيله"}
 
