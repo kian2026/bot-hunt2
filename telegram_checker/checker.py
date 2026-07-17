@@ -136,10 +136,21 @@ class SmartCheckStrategy:
                 "phone": phone,
                 "status_text": f"🚫 حظر مؤقت {e.seconds} ثانية"
             }
+        except PhoneNumberBannedError:
+            # This error describes the *phone being checked*, not the checker
+            # account.  Treating every error containing "BANNED" as an account
+            # failure disabled healthy new checker accounts after their first
+            # banned-number lookup.
+            logger.info(f"[Layer 1] Phone is banned. (Phone: {phone})")
+            return {
+                "status": "BANNED",
+                "phone": phone,
+                "status_text": "📵 مـحـظـور"
+            }
         except Exception as e:
             error_message = str(e).upper()
             logger.warning(f"[Layer 1] Silent Phase error: {e}")
-            if "BANNED" in error_message or "AUTH_KEY_UNREGISTERED" in error_message:
+            if "AUTH_KEY_UNREGISTERED" in error_message:
                 await account_manager.disable_account(account["id"])
                 return {"status": "ACCOUNT_DISABLED", "phone": phone, "status_text": "❌ حساب الفاحص تالف وتم تعطيله"}
 
