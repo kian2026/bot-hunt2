@@ -1,9 +1,8 @@
 import asyncio
-import os
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import (
-    SessionPasswordNeededError, PhoneCodeExpiredError, PhoneCodeInvalidError,
+    SessionPasswordNeededError, PhoneCodeExpiredError,
     FloodWaitError, ApiIdInvalidError, PhoneNumberInvalidError,
 )
 from database import save_telegram_account
@@ -18,7 +17,7 @@ class LoginManager:
         if phone in self.pending:
             try:
                 await self.pending[phone]["client"].disconnect()
-            except:
+            except Exception:
                 pass
             del self.pending[phone]
 
@@ -68,6 +67,11 @@ class LoginManager:
         except PhoneNumberInvalidError:
             await client.disconnect()
             raise Exception("رقم الهاتف غير صحيح.")
+        except Exception:
+            # Do not leak a connected client when Telegram rejects a request
+            # with an error type not covered above.
+            await client.disconnect()
+            raise
 
         self.pending[phone] = {
             "client": client,
@@ -102,8 +106,6 @@ class LoginManager:
                 raise Exception(f"فشل إعادة إرسال الكود: {e}")
         except FloodWaitError:
             raise
-        except Exception:
-            raise
 
     async def verify_password(self, phone, password):
         if phone not in self.pending:
@@ -116,8 +118,10 @@ class LoginManager:
             return await self._finish_login(phone)
         except FloodWaitError:
             raise
-        except Exception:
-            raise Exception("كلمة مرور التحقق بخطوتين غير صالحة.")
+        except Exception as error:
+            # Keep the pending login intact so the operator may retry, while
+            # preserving the actual failure for diagnostics.
+            raise Exception("كلمة مرور التحقق بخطوتين غير صالحة.") from error
 
     async def _finish_login(self, phone):
         data = self.pending[phone]
@@ -150,7 +154,7 @@ class LoginManager:
             return
         try:
             await self.pending[phone]["client"].disconnect()
-        except:
+        except Exception:
             pass
         del self.pending[phone]
 
@@ -159,7 +163,7 @@ class LoginManager:
         for phone in phones:
             try:
                 await self.pending[phone]["client"].disconnect()
-            except:
+            except Exception:
                 pass
         self.pending.clear()
 

@@ -109,6 +109,7 @@ class _PooledConnection:
     """
     def __init__(self, conn):
         self._conn = conn
+        self._closed = False
 
     def cursor(self):
         return self._conn.cursor()
@@ -124,7 +125,12 @@ class _PooledConnection:
 
     def close(self):
         """إعادة للـ Pool بدلاً من الإغلاق الفعلي"""
-        _return_to_pool(self._conn)
+        # Database callers occasionally close a connection explicitly inside a
+        # context manager.  Returning the same underlying connection twice
+        # would let two requests use it concurrently.
+        if not self._closed:
+            self._closed = True
+            _return_to_pool(self._conn)
 
     def __enter__(self):
         return self
@@ -140,7 +146,15 @@ def _warm_up_pool():
     conns = []
     for i in range(_POOL_SIZE):
         try:
-            conns.append(_make_conn())
+            # Warm connections count toward the same hard limit as connections
+            # opened on demand.
+            if not _open_connections_sem.acquire(blocking=False):
+                break
+            try:
+                conns.append(_make_conn())
+            except Exception:
+                _open_connections_sem.release()
+                raise
         except Exception as e:
             logger.warning(f"⚠️ تعذر فتح اتصال {i+1}: {e}")
             break
@@ -167,6 +181,11 @@ def db_execute(query, params=None, commit=True, fetch=None):
             elif fetch == "all":
                 return cursor.fetchall()
             return None
+        except Exception:
+            # Do not return a connection with an aborted transaction to the
+            # pool; PostgreSQL rejects every subsequent command on it.
+            conn.rollback()
+            raise
         finally:
             cursor.close()
 
@@ -235,9 +254,28 @@ def init_db():
                 cursor.execute("ALTER TABLE user_countries ADD COLUMN session_status TEXT DEFAULT 'all'")
                 conn.commit()
                 
-            # --- ترقية جدول حسابات الموقع إلى V2 (متعدد) ---
+            # Recover the short-lived V2 table if a previous deployment was
+            # interrupted between creating it and renaming it.
+            if (column_exists('user_site_accounts_v2', 'id')
+                    and not column_exists('user_site_accounts', 'id')):
+                cursor.execute("ALTER TABLE user_site_accounts_v2 RENAME TO user_site_accounts")
+                conn.commit()
+
+            legacy_site_accounts = (
+                column_exists('user_site_accounts', 'username')
+                and not column_exists('user_site_accounts', 'id')
+            )
+            if legacy_site_accounts:
+                cursor.execute(
+                    "ALTER TABLE user_site_accounts RENAME TO user_site_accounts_legacy"
+                )
+                conn.commit()
+
+            # Keep one stable table name.  The former V2 migration recreated
+            # an empty V2 table on every startup, then dropped the live table
+            # and renamed that empty table, silently deleting all accounts.
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_site_accounts_v2 (
+                CREATE TABLE IF NOT EXISTS user_site_accounts (
                     id SERIAL PRIMARY KEY,
                     user_id BIGINT NOT NULL,
                     username TEXT NOT NULL,
@@ -247,42 +285,14 @@ def init_db():
                 )
             """)
             conn.commit()
-
-            # نقل البيانات القديمة إذا كان الجدول القديم موجوداً ولم تتم ترقيته
-            if not column_exists('user_site_accounts_v2', 'is_active') and column_exists('user_site_accounts', 'username') and not column_exists('user_site_accounts', 'id'):
-                logger.info("Migrating old user_site_accounts to v2...")
-                try:
-                    cursor.execute("""
-                        INSERT INTO user_site_accounts_v2 (user_id, username, api_key, is_active)
-                        SELECT user_id, username, api_key, TRUE
-                        FROM user_site_accounts
-                        ON CONFLICT (user_id, username) DO NOTHING
-                    """)
-                    conn.commit()
-                    cursor.execute("DROP TABLE user_site_accounts")
-                    conn.commit()
-                except Exception as e:
-                    logger.warning(f"Migration error: {e}")
-                    conn.rollback()
-
-            # إعادة تسمية v2 إلى الاسم الأصلي
-            if column_exists('user_site_accounts_v2', 'is_active'):
-                cursor.execute("DROP TABLE IF EXISTS user_site_accounts")
-                conn.commit()
-                cursor.execute("ALTER TABLE user_site_accounts_v2 RENAME TO user_site_accounts")
-                conn.commit()
-                logger.info("Renamed user_site_accounts_v2 to user_site_accounts")
-            else:
+            if legacy_site_accounts:
                 cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS user_site_accounts (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT NOT NULL,
-                        username TEXT NOT NULL,
-                        api_key TEXT NOT NULL,
-                        is_active BOOLEAN DEFAULT FALSE,
-                        UNIQUE(user_id, username)
-                    )
+                    INSERT INTO user_site_accounts (user_id, username, api_key, is_active)
+                    SELECT user_id, username, api_key, TRUE
+                    FROM user_site_accounts_legacy
+                    ON CONFLICT (user_id, username) DO NOTHING
                 """)
+                cursor.execute("DROP TABLE user_site_accounts_legacy")
                 conn.commit()
 
             # جدول حسابات الفحص
@@ -312,7 +322,7 @@ def init_db():
                 try:
                     cursor.execute("ALTER TABLE telegram_accounts DROP COLUMN status")
                     conn.commit()
-                except:
+                except Exception:
                     pass
 
             cursor.execute("""
@@ -482,6 +492,9 @@ def init_db():
             cursor.execute("DELETE FROM checked_numbers_cache WHERE checked_at < NOW() - INTERVAL '14 days'")
             conn.commit()
 
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             cursor.close()
 
